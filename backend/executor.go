@@ -39,7 +39,6 @@ type Executor interface {
 
 type grpcExecutor struct {
 	protos.UnimplementedTaskHubSidecarServiceServer
-	workItemQueue        chan *protos.WorkItem
 	inflightWorkItems    *sync.Map
 	backend              Backend
 	logger               Logger
@@ -73,7 +72,6 @@ func WithStreamShutdownChannel(c <-chan any) grpcExecutorOptions {
 // NewGrpcExecutor returns the Executor object and a method to invoke to register the gRPC server in the executor.
 func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (executor Executor, registerServerFn func(grpcServer grpc.ServiceRegistrar)) {
 	grpcExecutor := &grpcExecutor{
-		workItemQueue:     make(chan *protos.WorkItem),
 		backend:           be,
 		logger:            logger,
 		inflightWorkItems: &sync.Map{},
@@ -115,13 +113,14 @@ func (executor *grpcExecutor) ExecuteOrchestrator(ctx context.Context, iid api.I
 		},
 	}
 
-	// Send the orchestration execution work-item to the connected worker.
-	// This will block if the worker isn't listening for work items.
-	select {
-	case <-ctx.Done():
-		executor.logger.Warnf("%s: context canceled before dispatching orchestrator work item", iid)
-		return nil, ctx.Err()
-	case executor.workItemQueue <- workItem:
+	err = executor.backend.EnqueueWorkItem(ctx, workItem)
+	if err != nil {
+		if ctx.Err() != nil {
+			executor.logger.Warnf("%s: context canceled before dispatching orchestrator work item", iid)
+			return nil, ctx.Err()
+		}
+		executor.logger.Errorf("%s: error queuing work item %v", iid, err)
+		return nil, err
 	}
 
 	// Wait for the connected worker to signal that it's done executing the work-item
@@ -175,13 +174,14 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 		},
 	}
 
-	// Send the activity execution work-item to the connected worker.
-	// This will block if the worker isn't listening for work items.
-	select {
-	case <-ctx.Done():
-		executor.logger.Warnf("%s/%s#%d: context canceled before dispatching activity work item", iid, task.Name, e.EventId)
-		return nil, ctx.Err()
-	case executor.workItemQueue <- workItem:
+	err = executor.backend.EnqueueWorkItem(ctx, workItem)
+	if err != nil {
+		if ctx.Err() != nil {
+			executor.logger.Warnf("%s/%s#%d: context canceled before dispatching activity work item", iid, task.Name, e.EventId)
+			return nil, ctx.Err()
+		}
+		executor.logger.Errorf("%s/%s#%d: error queuing work item %v", iid, task.Name, e.EventId, err)
+		return nil, err
 	}
 
 	// Wait for the connected worker to signal that it's done executing the work-item
@@ -213,9 +213,6 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 
 // Shutdown implements Executor
 func (g *grpcExecutor) Shutdown(ctx context.Context) error {
-	// closing the work item queue is a signal for shutdown
-	close(g.workItemQueue)
-
 	// Iterate through all inflight work items and cancel them to unblock the goroutines waiting on ExecuteOrchestrator or ExecuteActivity
 	g.inflightWorkItems.Range(func(key, value any) bool {
 		cancel, ok := value.(context.CancelFunc)
@@ -263,24 +260,35 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 		})
 	}()
 
+	shutdownCtx, shutdownCancel := context.WithCancel(stream.Context())
+	defer shutdownCancel()
+
+	consumeCtx, cancel := context.WithCancel(shutdownCtx)
+	defer cancel()
+
+	go func() {
+		<-g.streamShutdownChan
+		shutdownCancel()
+	}()
+
 	// The worker client invokes this method, which streams back work-items as they arrive.
-	for {
-		select {
-		case <-stream.Context().Done():
+	err := g.backend.ConsumeWorkItems(consumeCtx, func(wi *GenericWorkItem) error {
+		if err := stream.Send(wi); err != nil {
+			g.logger.Errorf("encountered an error while sending work item: %v", err)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		if stream.Context().Err() != nil {
 			g.logger.Info("work item stream closed")
 			return nil
-		case wi, ok := <-g.workItemQueue:
-			if !ok {
-				continue
-			}
-			if err := stream.Send(wi); err != nil {
-				g.logger.Errorf("encountered an error while sending work item: %v", err)
-				return err
-			}
-		case <-g.streamShutdownChan:
+		}
+		if shutdownCtx.Err() != nil {
 			return errShuttingDown
 		}
 	}
+	return nil
 }
 
 // CompleteOrchestratorTask implements protos.TaskHubSidecarServiceServer

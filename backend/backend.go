@@ -20,6 +20,7 @@ var (
 )
 
 type (
+	GenericWorkItem         = protos.WorkItem
 	HistoryEvent            = protos.HistoryEvent
 	TaskFailureDetails      = protos.TaskFailureDetails
 	OrchestratorResponse    = protos.OrchestratorResponse
@@ -116,6 +117,9 @@ type Backend interface {
 	SetPendingActivity(ctx context.Context, id api.InstanceID, taskID int32) error
 	CompletePendingActivity(ctx context.Context, res *ActivityResponse) error
 	WaitForPendingActivity(ctx context.Context, id api.InstanceID, taskID int32) (*ActivityResponse, error)
+
+	EnqueueWorkItem(ctx context.Context, wi *GenericWorkItem) error
+	ConsumeWorkItems(ctx context.Context, cb func(*GenericWorkItem) error) error
 }
 
 // MarshalHistoryEvent serializes the [HistoryEvent] into a protobuf byte array.
@@ -166,6 +170,22 @@ func UnmarshalActivityResponse(bytes []byte) (*ActivityResponse, error) {
 		return nil, fmt.Errorf("unreadable activity response payload: %w", err)
 	}
 	return r, nil
+}
+
+func MarshalGenericWorkItem(e *GenericWorkItem) ([]byte, error) {
+	if bytes, err := proto.Marshal(e); err != nil {
+		return nil, fmt.Errorf("failed to marshal work item: %w", err)
+	} else {
+		return bytes, nil
+	}
+}
+
+func UnmarshalGenericWorkItem(bytes []byte) (*GenericWorkItem, error) {
+	e := &protos.WorkItem{}
+	if err := proto.Unmarshal(bytes, e); err != nil {
+		return nil, fmt.Errorf("unreadable work item payload: %w", err)
+	}
+	return e, nil
 }
 
 // purgeOrchestrationState purges the orchestration state, including sub-orchestrations if [recursive] is true.
